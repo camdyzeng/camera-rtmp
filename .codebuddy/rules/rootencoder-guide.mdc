@@ -1,0 +1,698 @@
+---
+description: RootEncoder Android 流媒体库 API 文档（v2.5.2），包含 RTMP/RTSP/SRT 推流接口和代码示例
+alwaysApply: false
+enabled: true
+updatedAt: 2025-12-30T10:00:00.000Z
+provider: 
+---
+
+# RootEncoder Android 流媒体库 API 文档 (v2.5.2)
+
+> 官方仓库: https://github.com/pedroSG94/RootEncoder
+> 版本: 2.5.2 (2023-10-18)
+
+## ⚠️ 版本注意事项
+
+本文档基于 **RootEncoder 2.5.2** 版本。不同版本的 API 可能有差异，请确保使用正确的方法签名。
+
+---
+
+## 概述
+
+RootEncoder 是一个功能强大的 Android 流媒体编码器库，支持将音视频推送到媒体服务器。
+
+### 模块结构
+| 模块 | 说明 |
+|------|------|
+| `library` | 核心库，包含 GenericCamera2、GenericStream 等 |
+| `rtmp` | RTMP 协议实现 |
+| `rtsp` | RTSP 协议实现 |
+| `srt` | SRT 协议实现 (Beta) |
+| `udp` | UDP 协议实现 (Beta) |
+| `encoder` | 编码器核心 |
+| `common` | 通用组件，包含 ConnectChecker |
+| `extra-sources` | 额外视频源（CameraX、USB等） |
+
+### 支持的协议和编解码器
+| 协议 | 状态 | 编解码器 |
+|------|------|----------|
+| RTMP | ✅ 稳定 | H264、H265、AAC、G711 |
+| RTSP | ✅ 稳定 | H264、H265、AAC、G711、OPUS |
+| SRT | 🔶 测试版 | H264、H265、AAC、OPUS |
+| UDP | 🔶 测试版 | H264、H265、AAC、OPUS |
+
+---
+
+## 依赖配置
+
+### settings.gradle.kts
+```kotlin
+dependencyResolutionManagement {
+    repositories {
+        maven { url = uri("https://jitpack.io") }
+    }
+}
+```
+
+### build.gradle.kts (app)
+```kotlin
+dependencies {
+    // 核心库 - 使用 2.5.2 版本
+    implementation("com.github.pedroSG94.RootEncoder:library:2.5.2")
+    
+    // 可选：额外视频源
+    implementation("com.github.pedroSG94.RootEncoder:extra-sources:2.5.2")
+}
+```
+
+### AndroidManifest.xml 权限
+```xml
+<uses-permission android:name="android.permission.INTERNET" />
+<uses-permission android:name="android.permission.RECORD_AUDIO" />
+<uses-permission android:name="android.permission.CAMERA" />
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+```
+
+---
+
+## 核心类 API (v2.5.2)
+
+### 1. GenericCamera2 (推荐用于摄像头推流)
+
+**包路径**: `com.pedro.library.generic.GenericCamera2`  
+**继承**: `Camera2Base`  
+**要求**: Android API 21+
+
+#### 构造函数
+```kotlin
+// 使用 OpenGlView（推荐，支持滤镜）
+GenericCamera2(openGlView: OpenGlView, connectChecker: ConnectChecker)
+
+// 使用 Context（无预览，后台推流）
+GenericCamera2(context: Context, connectChecker: ConnectChecker)
+```
+
+**⚠️ 重要**: v2.5.2 版本中，预览通过构造函数传入 OpenGlView 设置，**不需要**调用 `getGlInterface().setPreview()`。
+
+#### 核心属性
+| 属性 | 类型 | 说明 |
+|------|------|------|
+| `isStreaming` | `Boolean` | 是否正在推流 |
+| `isOnPreview` | `Boolean` | 是否在预览 |
+| `isRecording` | `Boolean` | 是否在录制 |
+| `isLanternEnabled` | `Boolean` | 闪光灯是否开启 |
+| `isLanternSupported` | `Boolean` | 是否支持闪光灯 |
+| `bitrate` | `Int` | 当前码率 |
+| `streamWidth` | `Int` | 推流宽度 |
+| `streamHeight` | `Int` | 推流高度 |
+
+#### 视频配置方法
+
+```kotlin
+// 默认参数：640x480, 30fps, 1200kbps
+fun prepareVideo(): Boolean
+
+// 自定义参数（推荐）
+// ⚠️ 参数顺序: width, height, fps, bitrate, iFrameInterval, rotation
+fun prepareVideo(
+    width: Int,
+    height: Int,
+    fps: Int,           // 帧率，如 30
+    bitrate: Int,       // 码率（bps），如 4000000
+    iFrameInterval: Int,// 关键帧间隔（秒），如 2
+    rotation: Int       // 旋转角度，如 0
+): Boolean
+
+// 设置视频编码器（需在 prepareVideo 前调用）
+fun setVideoCodec(codec: VideoCodec)  // H264, H265
+```
+
+**⚠️ 常见错误**: fps 和 bitrate 参数位置容易混淆！
+```kotlin
+// ❌ 错误：bitrate 和 fps 位置颠倒
+camera.prepareVideo(1920, 1080, 4000000, 30, 2, 0)
+
+// ✅ 正确：fps 在前，bitrate 在后
+camera.prepareVideo(1920, 1080, 30, 4000000, 2, 0)
+```
+
+#### 音频配置方法
+
+```kotlin
+// 默认参数
+fun prepareAudio(): Boolean
+
+// 自定义参数（推荐）
+// ⚠️ 参数顺序: bitrate, sampleRate, isStereo, echoCanceler, noiseSuppressor
+fun prepareAudio(
+    bitrate: Int,           // 码率（bps），如 128000
+    sampleRate: Int,        // 采样率，如 44100
+    isStereo: Boolean,      // 是否立体声
+    echoCanceler: Boolean,  // 回声消除
+    noiseSuppressor: Boolean // 噪声抑制
+): Boolean
+```
+
+**⚠️ 常见错误**: 参数顺序与其他库不同！
+```kotlin
+// ❌ 错误：sampleRate 在前
+camera.prepareAudio(44100, true, 128000, false, false)
+
+// ✅ 正确：bitrate 在前
+camera.prepareAudio(128000, 44100, true, false, false)
+```
+
+#### 预览控制 (v2.5.2)
+
+**⚠️ 重要**: `startPreview` 有多种重载，根据实际源码（Camera2Base.java）确认如下：
+
+```kotlin
+// 完整的 startPreview 重载列表（v2.5.2 实际源码）
+fun startPreview()                                                              // 无参数
+fun startPreview(cameraFacing: CameraHelper.Facing)                             // 只传 facing
+fun startPreview(cameraId: String)                                              // 传摄像头 ID
+fun startPreview(width: Int, height: Int)                                       // 2 参数
+fun startPreview(cameraFacing: CameraHelper.Facing, width: Int, height: Int)    // 3 参数
+fun startPreview(cameraId: String, width: Int, height: Int)                     // 3 参数
+fun startPreview(cameraFacing: CameraHelper.Facing, rotation: Int)              // 2 参数
+fun startPreview(cameraId: String, rotation: Int)                               // 2 参数
+fun startPreview(cameraFacing: CameraHelper.Facing, width: Int, height: Int, rotation: Int)      // 4 参数
+fun startPreview(cameraId: String, width: Int, height: Int, rotation: Int)                       // 4 参数
+fun startPreview(cameraFacing: CameraHelper.Facing, width: Int, height: Int, fps: Int, rotation: Int)  // ⭐ 5 参数（推荐）
+fun startPreview(cameraId: String, width: Int, height: Int, fps: Int, rotation: Int)                   // 5 参数
+
+// 停止预览
+fun stopPreview()
+
+// 停止相机（释放资源）
+fun stopCamera()
+```
+
+**⚠️ 关键点**: `prepareVideo` 和 `startPreview` 的参数必须保持一致！
+
+```kotlin
+// ✅ 正确：prepareVideo 和 startPreview 参数一致
+val rotation = CameraHelper.getCameraOrientation(context)
+
+// prepareVideo 设置编码器参数
+camera.prepareVideo(1920, 1080, 30, 4000000, 2, rotation)
+
+// startPreview 设置摄像头采集参数（必须与 prepareVideo 一致！）
+camera.startPreview(
+    CameraHelper.Facing.BACK,
+    1920,   // 与 prepareVideo 的 width 一致
+    1080,   // 与 prepareVideo 的 height 一致
+    30,     // 与 prepareVideo 的 fps 一致
+    rotation // 与 prepareVideo 的 rotation 一致
+)
+
+// ❌ 错误：只传 facing，分辨率/帧率/旋转可能与 prepareVideo 不一致
+camera.startPreview(CameraHelper.Facing.BACK)  // 可能导致视频尺寸异常！
+```
+
+**最佳实践**：
+- 使用 5 参数版本 `startPreview(facing, width, height, fps, rotation)`
+- 确保与 `prepareVideo(width, height, fps, bitrate, iFrameInterval, rotation)` 的参数一致
+- 两者的 width、height、fps、rotation 必须相同
+
+#### 推流控制
+```kotlin
+// 开始推流（需先调用 prepareVideo/prepareAudio）
+fun startStream(url: String)
+
+// 停止推流
+fun stopStream()
+```
+
+#### 摄像头控制
+```kotlin
+// 切换前后摄像头
+fun switchCamera()
+fun switchCamera(cameraId: String)
+
+// 闪光灯
+fun enableLantern()
+fun disableLantern()
+
+// 动态调整码率（推流中可调用）
+fun setVideoBitrateOnFly(bitrate: Int)
+```
+
+#### 音频控制 (v2.5.2)
+
+**⚠️ 重要**: v2.5.2 版本中**没有** `setAudioMuted(boolean)` 方法，需使用以下替代方案：
+
+```kotlin
+// ✅ 正确：使用 disableAudio/enableAudio
+camera.disableAudio()  // 静音
+camera.enableAudio()   // 取消静音
+
+// ❌ 错误：setAudioMuted 在 v2.5.2 不存在
+camera.setAudioMuted(true)  // 编译错误！
+```
+
+#### 滤镜控制 (v2.5.2)
+
+```kotlin
+// 获取 GL 接口
+val glInterface = camera.getGlInterface()
+
+// 设置滤镜（参数类型必须是 BaseFilterRender）
+glInterface.setFilter(filter: BaseFilterRender)
+
+// 添加多个滤镜
+glInterface.addFilter(filter: BaseFilterRender)
+
+// 移除滤镜
+glInterface.removeFilter(index: Int)
+
+// 清空所有滤镜
+glInterface.clearFilters()
+```
+
+#### 资源释放 (v2.5.2)
+
+**⚠️ 重要**: v2.5.2 版本中**没有** `release()` 方法，需使用以下方式释放资源：
+
+```kotlin
+// ✅ 正确：使用 stopCamera() 释放资源
+fun releaseCamera() {
+    if (camera.isStreaming) camera.stopStream()
+    if (camera.isOnPreview) camera.stopPreview()
+    camera.stopCamera()  // 释放相机资源
+}
+
+// ❌ 错误：release() 在 v2.5.2 不存在
+camera.release()  // 编译错误！
+```
+
+---
+
+### 2. ConnectChecker 接口
+
+**包路径**: `com.pedro.common.ConnectChecker`
+
+```kotlin
+interface ConnectChecker {
+    // 开始连接
+    fun onConnectionStarted(url: String)
+    
+    // 连接成功
+    fun onConnectionSuccess()
+    
+    // 连接失败
+    fun onConnectionFailed(reason: String)
+    
+    // 断开连接
+    fun onDisconnect()
+    
+    // 认证失败
+    fun onAuthError()
+    
+    // 认证成功
+    fun onAuthSuccess()
+    
+    // 码率变化
+    fun onNewBitrate(bitrate: Long)
+}
+```
+
+---
+
+## 可用滤镜列表 (v2.5.2)
+
+### 基础滤镜
+| 滤镜类 | 说明 | 状态 |
+|--------|------|------|
+| `NoFilterRender` | 无滤镜（原始画面） | ✅ |
+| `BaseFilterRender` | 基础滤镜类（抽象类） | ✅ |
+
+### 颜色调整滤镜
+| 滤镜类 | 说明 | 可调参数 |
+|--------|------|----------|
+| `BrightnessFilterRender` | 亮度调整 | `setBrightness(float)` |
+| `ContrastFilterRender` | 对比度调整 | `setContrast(float)` |
+| `SaturationFilterRender` | 饱和度调整 | `setSaturation(float)` |
+| `GammaFilterRender` | 伽马校正 | `setGamma(float)` |
+| `ExposureFilterRender` | 曝光调整 | `setExposure(float)` |
+| `TemperatureFilterRender` | 色温调整 | `setTemperature(float)` |
+| `ColorFilterRender` | 颜色滤镜 | - |
+| `RGBSaturationFilterRender` | RGB饱和度 | - |
+
+### 风格滤镜
+| 滤镜类 | 说明 |
+|--------|------|
+| `GreyScaleFilterRender` | 灰度效果 |
+| `SepiaFilterRender` | 棕褐色调（复古） |
+| `NegativeFilterRender` | 反色效果 |
+| `DuotoneFilterRender` | 双色调效果 |
+| `EarlyBirdFilterRender` | 早鸟风格 |
+| `Image70sFilterRender` | 70年代风格 |
+| `LamoishFilterRender` | Lamoish风格 |
+| `MoneyFilterRender` | 金钱风格 |
+
+### 图像处理滤镜
+| 滤镜类 | 说明 |
+|--------|------|
+| `BeautyFilterRender` | 美颜滤镜 |
+| `BlurFilterRender` | 模糊效果 |
+| `SharpnessFilterRender` | 锐化效果 |
+| `EdgeDetectionFilterRender` | 边缘检测 |
+| `CartoonFilterRender` | 卡通化效果 |
+| `PixelatedFilterRender` | 像素化效果 |
+| `PolygonizationFilterRender` | 多边形化效果 |
+
+### 特效滤镜
+| 滤镜类 | 说明 |
+|--------|------|
+| `AnalogTVFilterRender` | 模拟电视效果 |
+| `GlitchFilterRender` | 故障风格效果 |
+| `SnowFilterRender` | 下雪效果 |
+| `FireFilterRender` | 火焰效果 |
+| `RainbowFilterRender` | 彩虹效果 |
+| `ZebraFilterRender` | 斑马纹效果 |
+| `RippleFilterRender` | 涟漪效果 |
+| `SwirlFilterRender` | 漩涡效果 |
+| `NoiseFilterRender` | 噪点滤镜 |
+
+### 变形滤镜
+| 滤镜类 | 说明 |
+|--------|------|
+| `BasicDeformationFilterRender` | 基础变形 |
+| `CircleFilterRender` | 圆形遮罩 |
+| `CropFilterRender` | 裁剪滤镜 |
+| `RotationFilterRender` | 旋转效果 |
+| `HalftoneLinesFilterRender` | 半色调线条 |
+
+### 特殊功能滤镜
+| 滤镜类 | 说明 |
+|--------|------|
+| `ChromaFilterRender` | 色度键（绿幕抠图） |
+| `BlackFilterRender` | 黑屏滤镜 |
+| `AndroidViewFilterRender` | Android视图滤镜 |
+
+### ⚠️ v2.5.2 不存在的滤镜
+以下滤镜在 v2.5.2 中**不存在**，请勿使用：
+- ❌ `AquaFilterRender`
+- ❌ `PosterizeFilterRender`
+- ❌ `SharpFilterRender`（使用 `SharpnessFilterRender` 替代）
+
+---
+
+## 完整示例代码 (v2.5.2)
+
+### 示例：使用前台服务推流
+
+```kotlin
+class StreamService : Service(), ConnectChecker {
+    
+    private var camera: GenericCamera2? = null
+    private var currentUrl: String = ""
+    
+    fun initCamera(openGlView: OpenGlView) {
+        // 使用 OpenGlView 构造函数
+        camera = GenericCamera2(openGlView, this)
+    }
+    
+    fun startStream(url: String, config: StreamConfig) {
+        currentUrl = url
+        camera?.let { cam ->
+            // ⚠️ 注意参数顺序：width, height, fps, bitrate, iFrameInterval, rotation
+            val videoPrepared = cam.prepareVideo(
+                config.width,
+                config.height,
+                config.fps,              // fps 在前
+                config.videoBitrate,     // bitrate 在后
+                config.iFrameInterval,
+                0
+            )
+            
+            // ⚠️ 注意参数顺序：bitrate, sampleRate, isStereo, echoCanceler, noiseSuppressor
+            val audioPrepared = cam.prepareAudio(
+                config.audioBitrate,     // bitrate 在前
+                config.sampleRate,       // sampleRate 在后
+                config.isStereo,
+                config.echoCanceler,
+                config.noiseSuppressor
+            )
+            
+            if (videoPrepared && audioPrepared) {
+                cam.startPreview(CameraHelper.Facing.BACK)
+                cam.startStream(url)
+            }
+        }
+    }
+    
+    fun stopStream() {
+        camera?.stopStream()
+    }
+    
+    fun toggleMute(mute: Boolean) {
+        camera?.let { cam ->
+            // ⚠️ v2.5.2 使用 disableAudio/enableAudio
+            if (mute) {
+                cam.disableAudio()
+            } else {
+                cam.enableAudio()
+            }
+        }
+    }
+    
+    fun setFilter(filter: BaseFilterRender) {
+        camera?.getGlInterface()?.setFilter(filter)
+    }
+    
+    fun releaseCamera() {
+        camera?.let { cam ->
+            if (cam.isStreaming) cam.stopStream()
+            if (cam.isOnPreview) cam.stopPreview()
+            // ⚠️ v2.5.2 使用 stopCamera() 而非 release()
+            cam.stopCamera()
+        }
+        camera = null
+    }
+    
+    override fun onDestroy() {
+        releaseCamera()
+        super.onDestroy()
+    }
+    
+    // ConnectChecker 回调实现
+    override fun onConnectionStarted(url: String) { /* ... */ }
+    override fun onConnectionSuccess() { /* ... */ }
+    override fun onConnectionFailed(reason: String) { /* ... */ }
+    override fun onDisconnect() { /* ... */ }
+    override fun onAuthError() { /* ... */ }
+    override fun onAuthSuccess() { /* ... */ }
+    override fun onNewBitrate(bitrate: Long) { /* ... */ }
+}
+
+data class StreamConfig(
+    val width: Int = 1920,
+    val height: Int = 1080,
+    val fps: Int = 30,
+    val videoBitrate: Int = 4_000_000,
+    val audioBitrate: Int = 128_000,
+    val sampleRate: Int = 44100,
+    val isStereo: Boolean = true,
+    val iFrameInterval: Int = 2,
+    val echoCanceler: Boolean = false,
+    val noiseSuppressor: Boolean = false
+)
+```
+
+### 示例：滤镜使用
+
+```kotlin
+// 获取 GL 接口
+val glInterface = camera.getGlInterface()
+
+// 设置单个滤镜
+glInterface.setFilter(GreyScaleFilterRender())
+
+// 可调参数滤镜
+glInterface.setFilter(ContrastFilterRender().apply { 
+    setContrast(1.5f)
+})
+glInterface.setFilter(BrightnessFilterRender().apply { 
+    setBrightness(0.2f)
+})
+glInterface.setFilter(SharpnessFilterRender().apply { 
+    setSharpness(0.5f)  // ⚠️ 使用 SharpnessFilterRender，不是 SharpFilterRender
+})
+
+// 多滤镜叠加
+glInterface.addFilter(BeautyFilterRender())
+glInterface.addFilter(ContrastFilterRender())
+glInterface.removeFilter(0)  // 移除第一个
+glInterface.clearFilters()   // 清空所有
+```
+
+---
+
+## 常用分辨率和码率推荐
+
+| 分辨率 | 推荐码率 | 帧率 | 适用场景 |
+|--------|----------|------|----------|
+| 3840x2160 (4K) | 15-25 Mbps | 30 | 超高清 |
+| 1920x1080 | 4-6 Mbps | 30 | 高清直播 |
+| 1280x720 | 2-4 Mbps | 30 | 标清直播 |
+| 854x480 | 1-2 Mbps | 30 | 流畅直播 |
+| 640x360 | 500k-1 Mbps | 30 | 低带宽 |
+
+---
+
+## v2.5.2 API 差异总结
+
+| 功能 | v2.6.x+ | v2.5.2 |
+|------|---------|--------|
+| 静音控制 | `setAudioMuted(boolean)` | `disableAudio()` / `enableAudio()` |
+| 释放资源 | `release()` | `stopCamera()` |
+| 设置预览 | `getGlInterface().setPreview()` | 构造函数传入 OpenGlView |
+| 锐化滤镜 | `SharpFilterRender` | `SharpnessFilterRender` |
+| Aqua滤镜 | `AquaFilterRender` | ❌ 不存在 |
+| Posterize滤镜 | `PosterizeFilterRender` | ❌ 不存在 |
+
+---
+
+## ⚠️ v2.5.2 不存在的 API 汇总
+
+以下 API 在 v2.5.2 中**不存在**，请勿使用：
+
+| 错误用法 | 正确替代 |
+|----------|----------|
+| `camera.setAudioMuted(true)` | `camera.disableAudio()` |
+| `camera.setAudioMuted(false)` | `camera.enableAudio()` |
+| `camera.release()` | `camera.stopCamera()` |
+| `SharpFilterRender` | `SharpnessFilterRender` |
+| `AquaFilterRender` | ❌ 无替代 |
+| `PosterizeFilterRender` | ❌ 无替代 |
+
+---
+
+## ⚠️ 视频尺寸问题排查
+
+如果推流视频尺寸/比例异常（如图像缩小在中间或黑屏），检查以下几点：
+
+### 1. Context 模式下必须预先交换宽高并设置 rotation=0！（重要）
+
+**问题根因**：在 Context 模式（后台模式）下，RootEncoder 2.5.2 存在一个尺寸不匹配的问题：
+
+1. `prepareGlView` 会根据 rotation 交换 `glInterface` 的尺寸
+2. 但 `cameraManager.prepareCamera` 使用 `videoEncoder.getWidth/Height`（原始值）
+3. 这导致 GL 尺寸和摄像头尺寸不匹配，视频黑屏或缩小
+
+**解决方案**：预先交换宽高，并设置 `rotation=0`
+
+```kotlin
+val rotation = CameraHelper.getCameraOrientation(context)
+
+// ⚠️ 关键：根据 rotation 预先交换宽高
+val (videoWidth, videoHeight) = if (rotation == 90 || rotation == 270) {
+    // 竖屏：交换宽高（1920x1080 变成 1080x1920）
+    settings.videoHeight to settings.videoWidth
+} else {
+    // 横屏：保持原样
+    settings.videoWidth to settings.videoHeight
+}
+
+// ✅ 正确：传入交换后的宽高，rotation=0
+// 这样 videoEncoder、glInterface、cameraManager 三者尺寸一致
+camera.prepareVideo(videoWidth, videoHeight, 30, 4000000, 2, 0)  // rotation=0
+camera.startPreview(CameraHelper.Facing.BACK, videoWidth, videoHeight, 30, 0)  // rotation=0
+
+// ❌ 错误：直接传入用户设置的宽高和 rotation
+camera.prepareVideo(1920, 1080, 30, 4000000, 2, 90)
+// 结果：
+// - videoEncoder 存储 1920x1080
+// - prepareGlView 交换后 glInterface 设为 1080x1920
+// - cameraManager 使用 videoEncoder 的 1920x1080
+// - GL 和摄像头尺寸不匹配，视频黑屏！
+```
+
+**原理说明**：
+- 设置 `rotation=0` 后，`prepareGlView` 不会交换宽高
+- `glInterface.setEncoderSize` 使用我们传入的尺寸（1080x1920）
+- `cameraManager.prepareCamera` 也使用相同的尺寸（1080x1920）
+- `glInterface.setRotation(0 == 0 ? 270 : 0 - 90)` = 270，GL 会旋转 270 度
+- 这样摄像头采集的横向数据会被正确旋转成竖向
+
+### 2. prepareVideo 和 startPreview 参数必须一致
+
+```kotlin
+val rotation = CameraHelper.getCameraOrientation(context)
+val (w, h) = if (rotation == 90 || rotation == 270) {
+    height to width
+} else {
+    width to height
+}
+
+// ✅ 正确：两者参数完全一致
+camera.prepareVideo(w, h, 30, 4000000, 2, rotation)
+camera.startPreview(CameraHelper.Facing.BACK, w, h, 30, rotation)
+```
+
+### 3. rotation 参数必须正确
+
+```kotlin
+// ✅ 正确：使用 CameraHelper 获取旋转角度
+val rotation = CameraHelper.getCameraOrientation(context)
+
+// ❌ 错误：硬编码 rotation = 0
+camera.prepareVideo(1920, 1080, 30, 4000000, 2, 0)  // 竖屏时会出问题！
+```
+
+### 4. 源码分析（为什么需要预先交换宽高）
+
+在 `Camera2Base.java` 中：
+```java
+// prepareGlView 方法会交换宽高用于 GL 渲染
+private void prepareGlView(int width, int height, int rotation) {
+    int w = width, h = height;
+    if (rotation == 90 || rotation == 270) {
+        h = width; w = height;  // 交换
+    }
+    glInterface.setEncoderSize(w, h);  // GL 尺寸正确
+    // 但是！摄像头使用的是 videoEncoder 的原始值
+    cameraManager.prepareCamera(..., videoEncoder.getWidth(), videoEncoder.getHeight(), ...);
+    // 如果 videoEncoder 存储的是 1920x1080，摄像头就会采集 1920x1080
+    // 但 GL 期望的是 1080x1920，导致尺寸不匹配！
+}
+```
+
+---
+
+## 常见问题
+
+### Q: 推流黑屏？
+- 确认调用了 `prepareVideo()` 返回 `true`
+- 确认调用了 `startPreview()`
+- 检查 CAMERA 权限
+- 检查 OpenGlView 是否正确初始化
+
+### Q: 没有声音？
+- 确认调用了 `prepareAudio()` 返回 `true`
+- 检查 RECORD_AUDIO 权限
+- 检查是否调用了 `disableAudio()`
+
+### Q: 连接失败？
+- 检查 INTERNET 权限
+- 验证 RTMP URL 格式：`rtmp://host/app/streamKey`
+- 检查服务器是否在线
+- 检查防火墙/网络策略
+
+### Q: 编译错误 "Unresolved reference"？
+- 检查是否使用了正确版本的 API（参考本文档的 v2.5.2 差异总结）
+- 确认滤镜类名正确（如 `SharpnessFilterRender` 而非 `SharpFilterRender`）
+- 确认 `startPreview` 参数数量正确（**不要用 5 参数版本**，只有 0/1/4 参数的重载）
+
+---
+
+## 相关资源
+
+- **GitHub**: https://github.com/pedroSG94/RootEncoder
+- **Wiki**: https://github.com/pedroSG94/RootEncoder/wiki
+- **示例代码**: https://github.com/pedroSG94/RootEncoder/tree/2.5.2/app
+- **滤镜列表**: https://github.com/pedroSG94/RootEncoder/tree/2.5.2/encoder/src/main/java/com/pedro/encoder/input/gl/render/filters

@@ -1,0 +1,108 @@
+---
+description: 
+alwaysApply: true
+enabled: true
+updatedAt: 2026-01-19T06:23:35.379Z
+provider: 
+---
+
+# Windows 命令格式规则
+
+## 基本原则
+在 Windows 环境下执行命令时，必须使用正确的 Windows 命令格式，避免使用 Unix/Linux 格式。
+
+## 路径格式
+### ✅ 正确格式
+```bash
+# Windows 路径使用反斜杠或正斜杠都可以，但推荐使用正斜杠
+cd h:\scf-test\camera-rtmp
+cd h:/scf-test/camera-rtmp
+```
+
+### ❌ 错误格式
+```bash
+# 不要使用 Unix 风格的路径
+cd /h/scf-test/camera-rtmp
+```
+
+## 可执行文件格式
+### ✅ 正确格式
+```bash
+# Windows 下的 Gradle 命令
+gradlew.bat assembleDebug
+gradlew.bat clean
+gradlew.bat build
+
+# 其他 Windows 批处理文件
+script.bat
+setup.exe
+```
+
+### ❌ 错误格式
+```bash
+# 不要省略 .bat 扩展名
+./gradlew assembleDebug
+gradlew assembleDebug
+```
+
+## 常见命令对照表
+
+| 功能 | Unix/Linux | Windows |
+|------|------------|---------|
+| Gradle 编译 | `./gradlew assembleDebug` | `gradlew.bat assembleDebug` |
+| 清理项目 | `./gradlew clean` | `gradlew.bat clean` |
+| 构建项目 | `./gradlew build` | `gradlew.bat build` |
+| 目录切换 | `cd /path/to/dir` | `cd h:\path\to\dir` |
+| 列出文件 | `ls -la` | `dir` |
+| 查看文件 | `cat file.txt` | `type file.txt` |
+
+## Android 开发常用命令
+### ✅ 正确的 Windows 格式
+```bash
+# 编译 Debug APK
+cd h:\scf-test\camera-rtmp && gradlew.bat assembleDebug
+
+# 编译 Release APK
+cd h:\scf-test\camera-rtmp && gradlew.bat assembleRelease
+
+# 清理项目
+cd h:\scf-test\camera-rtmp && gradlew.bat clean
+
+# 安装 APK
+adb install -r app\build\outputs\apk\debug\app-debug.apk
+
+# 查看 ADB 设备
+adb devices
+
+# 查看日志
+adb logcat -s StreamService
+```
+
+## PowerShell 特殊情况
+在 PowerShell 环境下，某些命令可能需要特殊处理：
+
+```powershell
+# 如果遇到执行策略问题
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+
+# 执行批处理文件
+& ".\gradlew.bat" assembleDebug
+```
+
+## 环境检测
+在执行命令前，可以通过以下方式确认环境：
+- 检查 `OS Version: win32` 确认是 Windows 环境
+- 检查 `Shell: C:\WINDOWS\System32\WindowsPowerShell\v1` 确认是 PowerShell
+
+## 错误处理
+如果命令执行失败，优先检查：
+1. 是否使用了正确的 Windows 命令格式
+2. 路径分隔符是否正确
+3. 可执行文件扩展名是否完整
+4. 当前工作目录是否正确
+
+## 注意事项
+- Windows 路径不区分大小写，但建议保持一致
+- 使用 `&&` 连接多个命令在 Windows 下同样有效
+- 某些 Unix 命令在 Windows 下有对应的替代命令
+- Git Bash 环境下可以使用 Unix 格式，但 PowerShell/CMD 下必须使用 Windows 格式

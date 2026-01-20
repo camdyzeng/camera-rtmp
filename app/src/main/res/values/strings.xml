@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">摄像头推流</string>
+    <string name="notification_channel_name">推流服务</string>
+    <string name="notification_channel_description">用于显示推流服务状态</string>
+</resources>
