@@ -27,31 +27,22 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /**
- * RTMP 推流服务 - Context 模式（无预览后台推流）
+ * RTMP 推流服务 - 简化版
  * 
- * 使用 GenericCamera2(context, connectChecker) 构造函数
- * 
- * Context 模式特点：
- * - 无需 UI 组件（OpenGlView/SurfaceView）
- * - 适合后台推流场景
- * - 页面切换不影响推流
- * - 需要预先处理分辨率和旋转参数
- * 
- * 分辨率处理说明：
- * RootEncoder 在 Context 模式下存在一个已知问题：
- * - prepareGlView() 会根据 rotation 交换 GL 渲染尺寸
- * - 但 cameraManager 使用的是原始尺寸
- * - 导致尺寸不匹配
- * 
- * 解决方案：
- * - 在调用 prepareVideo 之前，根据设备方向预先交换宽高
- * - 传入 rotation=0，避免库再次交换
+ * 设计原则：
+ * 1. 只有两个状态：STOPPED/RUNNING
+ * 2. Watchdog 永久运行，根据状态判断是否执行检查
+ * 3. 重连逻辑简单：延迟2秒后重连
+ * 4. onDisconnect 不触发重连
+ * 5. onConnectionFailed 只在之前成功过时触发一次重连
+ * 6. 其他异常由 Watchdog 监控处理
  */
 class StreamService : Service(), ConnectChecker {
     
     companion object {
         private const val TAG = "StreamService"
         private const val NOTIFICATION_ID = 1001
+        private const val RECONNECT_DELAY_MS = 2000L  // 重连前等待时间
         
         const val ACTION_START_STREAMING = "com.example.camera_rtmp.START_STREAMING"
         const val ACTION_STOP_STREAMING = "com.example.camera_rtmp.STOP_STREAMING"
@@ -60,8 +51,6 @@ class StreamService : Service(), ConnectChecker {
             val intent = Intent(context, StreamService::class.java).apply {
                 action = ACTION_START_STREAMING
             }
-            // Android 8.0 (API 26) 及以上版本需要使用 startForegroundService
-            // Android 7.x 直接使用 startService
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)
             } else {
@@ -83,8 +72,34 @@ class StreamService : Service(), ConnectChecker {
     
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     
+    // ==================== 简化状态管理 ====================
+    
+    private val stateManager = SimpleStateManager()
+    private lateinit var watchdogManager: WatchdogManager
+    
+    // 当前推流 URL
+    private var currentUrl: String = ""
+    
+    // 计算后的视频尺寸（重连时保持一致）
+    private var computedWidth: Int = 0
+    private var computedHeight: Int = 0
+    
+    // 标记是否曾经连接成功（用于控制 onConnectionFailed 的重连）
+    @Volatile
+    private var hasConnectedSuccessfully = false
+    
+    // 重连任务
+    private var reconnectJob: Job? = null
+    
+    // 对外暴露的状态接口
     private val _streamState = MutableStateFlow<StreamState>(StreamState.Idle)
     val streamState: StateFlow<StreamState> = _streamState.asStateFlow()
+    
+    val watchdogStats: StateFlow<WatchdogManager.WatchdogStats> by lazy { 
+        watchdogManager.stats 
+    }
+    
+    // ==================== 其他状态 ====================
     
     private val _streamStats = MutableStateFlow(StreamStats())
     val streamStats: StateFlow<StreamStats> = _streamStats.asStateFlow()
@@ -101,22 +116,11 @@ class StreamService : Service(), ConnectChecker {
     private val _isServiceRunning = MutableStateFlow(false)
     val isServiceRunning: StateFlow<Boolean> = _isServiceRunning.asStateFlow()
     
+    // ==================== 配置和临时变量 ====================
+    
     private var currentSettings = StreamSettings()
     private var streamStartTime: Long = 0
     private val handler = Handler(Looper.getMainLooper())
-    private var reconnectRunnable: Runnable? = null
-    private var currentRtmpUrl: String = ""
-    
-    // 存储计算后的视频尺寸（用于重连）
-    private var computedVideoWidth: Int = 0
-    private var computedVideoHeight: Int = 0
-    
-    // 指数退避重连相关变量
-    private var reconnectAttempts: Int = 0
-    private var firstReconnectTime: Long = 0L // 首次重连时间戳
-    private val baseReconnectDelay: Long = 1000L // 基础重连延迟1秒（毫秒）
-    private val maxReconnectDelay: Long = 60 * 60 * 1000L // 最大延迟1小时（毫秒）
-    private val maxReconnectDuration: Long = 30L * 24 * 60 * 60 * 1000L // 最大重连时间30天（毫秒）
     
     inner class StreamBinder : Binder() {
         fun getService(): StreamService = this@StreamService
@@ -125,6 +129,28 @@ class StreamService : Service(), ConnectChecker {
     override fun onCreate() {
         super.onCreate()
         Log.d(TAG, "Service created")
+        
+        // 初始化 Watchdog 管理器
+        watchdogManager = WatchdogManager(
+            stateManager = stateManager,
+            handler = handler,
+            onAnomalyDetected = { anomaly -> handleWatchdogAnomaly(anomaly) }
+        )
+        
+        // 启动永久运行的 Watchdog
+        val watchdogConfig = WatchdogManager.WatchdogConfig(
+            checkInterval = currentSettings.watchdogCheckInterval,
+            bitrateTimeout = currentSettings.watchdogBitrateTimeout,
+            minBitrateThreshold = currentSettings.watchdogMinBitrateThreshold,
+            maxZeroBitrateCount = currentSettings.watchdogMaxZeroBitrateCount,
+            connectionTimeout = currentSettings.watchdogConnectionTimeout,
+            enableBitrateMonitoring = currentSettings.watchdogEnabled,
+            enableConnectionMonitoring = currentSettings.watchdogEnabled,
+            enableEncoderMonitoring = currentSettings.watchdogEnabled
+        )
+        watchdogManager.startPermanentWatchdog(watchdogConfig, serviceScope)
+        
+        Log.d(TAG, "Permanent watchdog started")
     }
     
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -135,8 +161,6 @@ class StreamService : Service(), ConnectChecker {
             }
             ACTION_STOP_STREAMING -> {
                 stopStreaming()
-                // Android 7.0 (API 24) 及以上版本支持 STOP_FOREGROUND_REMOVE
-                // 更低版本使用传统的 stopForeground(true)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                     stopForeground(STOP_FOREGROUND_REMOVE)
                 } else {
@@ -159,22 +183,20 @@ class StreamService : Service(), ConnectChecker {
         Log.d(TAG, "Service destroyed - performing complete cleanup")
         
         try {
-            // 取消所有协程
             serviceScope.cancel()
             
-            // 取消重连
+            if (::watchdogManager.isInitialized) {
+                watchdogManager.destroy()
+            }
+            
             cancelReconnect()
-            
-            // 完全释放所有资源（更新状态并清空URL）
-            releaseAllResources(updateState = true, clearUrl = true)
-            
-            // 释放 WakeLock
+            releaseAllResources()
             releaseWakeLock()
             
-            // 重置所有状态
+            stateManager.setStopped()
             _isServiceRunning.value = false
             _streamStats.value = StreamStats()
-            resetReconnectAttempts()
+            _streamState.value = StreamState.Idle
             
             Log.d(TAG, "Service cleanup completed successfully")
         } catch (e: Exception) {
@@ -184,51 +206,62 @@ class StreamService : Service(), ConnectChecker {
     
     // ==================== 公共 API ====================
     
-    /**
-     * 初始化推流设置
-     */
     fun initializeStreaming(settings: StreamSettings) {
         this.currentSettings = settings
         _currentCameraFacing.value = settings.cameraFacing
+        
+        if (::watchdogManager.isInitialized) {
+            val watchdogConfig = WatchdogManager.WatchdogConfig(
+                checkInterval = settings.watchdogCheckInterval,
+                bitrateTimeout = settings.watchdogBitrateTimeout,
+                minBitrateThreshold = settings.watchdogMinBitrateThreshold,
+                maxZeroBitrateCount = settings.watchdogMaxZeroBitrateCount,
+                connectionTimeout = settings.watchdogConnectionTimeout,
+                enableBitrateMonitoring = settings.watchdogEnabled,
+                enableConnectionMonitoring = settings.watchdogEnabled,
+                enableEncoderMonitoring = settings.watchdogEnabled
+            )
+            watchdogManager.updateConfig(watchdogConfig)
+        }
+        
         Log.d(TAG, "Streaming initialized with settings: $settings")
     }
     
-    /**
-     * 更新设置
-     */
     fun updateSettings(settings: StreamSettings) {
         currentSettings = settings
-        // 如果正在推流，动态更新码率
-        if (_streamState.value is StreamState.Streaming) {
+        if (stateManager.isRunning()) {
             genericCamera2?.setVideoBitrateOnFly(settings.videoBitrate * 1000)
         }
     }
     
-    /**
-     * 开始推流（Context 模式 - 无预览后台推流）
-     */
     fun startStreaming(url: String): Boolean {
-        if (_streamState.value is StreamState.Streaming || 
-            _streamState.value is StreamState.Connecting) {
-            Log.w(TAG, "Already streaming or connecting")
+        Log.d(TAG, "User requested start streaming: $url")
+        
+        if (stateManager.isRunning()) {
+            Log.w(TAG, "Already running, ignoring start request")
             return false
         }
         
-        currentRtmpUrl = url
-        // 开始新的推流会话时重置重连计数器
-        resetReconnectAttempts()
+        if (url.isBlank()) {
+            Log.e(TAG, "URL is empty")
+            return false
+        }
+        
+        // 重置状态
+        currentUrl = url
+        hasConnectedSuccessfully = false
+        stateManager.setRunning()
+        
         _streamState.value = StreamState.Preparing
         updateNotification("正在准备...")
         
         try {
             acquireWakeLock()
+            releaseAllResources()
             
-            // 释放之前的摄像头实例（确保完全清理，但不清空URL）
-            releaseAllResources(updateState = false, clearUrl = false)
-            
-            // 使用公共方法初始化并开始推流
             val success = initAndStartStream(url, recalculateResolution = true)
             if (!success) {
+                stateManager.setStopped()
                 _streamState.value = StreamState.Error("推流启动失败")
                 releaseWakeLock()
                 return false
@@ -236,35 +269,40 @@ class StreamService : Service(), ConnectChecker {
             
             _streamState.value = StreamState.Connecting
             updateNotification("正在连接...")
+            Log.d(TAG, "Stream initialization successful")
             return true
             
         } catch (e: Exception) {
             Log.e(TAG, "Error starting stream", e)
+            stateManager.setStopped()
             _streamState.value = StreamState.Error("推流启动失败: ${e.message}")
             releaseWakeLock()
             return false
         }
     }
     
-    /**
-     * 停止推流
-     */
     fun stopStreaming() {
         Log.d(TAG, "User requested stop streaming")
-        cancelReconnect()
         
-        // 使用统一的资源释放方法，更新状态并清空URL
-        releaseAllResources(updateState = true, clearUrl = true)
+        if (stateManager.isStopped()) {
+            Log.d(TAG, "Already stopped, ignoring stop request")
+            return
+        }
+        
+        hasConnectedSuccessfully = false
+        cancelReconnect()
+        stateManager.setStopped()
+        releaseAllResources()
+        
+        _streamState.value = StreamState.Idle
+        _streamStats.value = StreamStats()
         
         releaseWakeLock()
-        _streamStats.value = StreamStats()
         updateNotification("已停止")
+        
         Log.d(TAG, "Streaming stopped by user")
     }
     
-    /**
-     * 切换摄像头
-     */
     fun switchCamera() {
         genericCamera2?.let { camera ->
             try {
@@ -274,15 +312,11 @@ class StreamService : Service(), ConnectChecker {
                 } else {
                     CameraFacing.FRONT
                 }
-                // 切换摄像头后关闭闪光灯
                 _isFlashOn.value = false
                 
-                // 切换摄像头后更新镜像设置
-                // 前置摄像头需要水平翻转，后置摄像头不需要
                 val isFrontCamera = _currentCameraFacing.value == CameraFacing.FRONT
                 try {
                     camera.getGlInterface().setIsStreamHorizontalFlip(isFrontCamera)
-                    Log.d(TAG, "Stream horizontal flip updated to: $isFrontCamera")
                 } catch (e: Exception) {
                     Log.w(TAG, "Failed to update stream horizontal flip: ${e.message}")
                 }
@@ -294,9 +328,6 @@ class StreamService : Service(), ConnectChecker {
         }
     }
     
-    /**
-     * 切换静音
-     */
     fun toggleMute() {
         genericCamera2?.let { camera ->
             val newMuteState = !_isMuted.value
@@ -314,9 +345,6 @@ class StreamService : Service(), ConnectChecker {
         }
     }
     
-    /**
-     * 切换闪光灯
-     */
     fun toggleFlash(): Boolean {
         genericCamera2?.let { camera ->
             if (_currentCameraFacing.value == CameraFacing.BACK && camera.isLanternSupported) {
@@ -338,94 +366,48 @@ class StreamService : Service(), ConnectChecker {
         return false
     }
     
-    /**
-     * 设置码率
-     */
     fun setBitrate(bitrate: Int) {
         genericCamera2?.setVideoBitrateOnFly(bitrate * 1000)
         Log.d(TAG, "Bitrate set to: ${bitrate}kbps")
     }
     
-    /**
-     * 统一的资源释放方法
-     * 合并了原来的 releaseCamera 和 releaseResourcesForReconnect 方法
-     * 
-     * @param updateState 是否更新流状态为 Idle（用户主动停止时为 true，重连时为 false）
-     * @param clearUrl 是否清空 RTMP URL（用户主动停止时为 true，重连时为 false）
-     */
-    private fun releaseAllResources(updateState: Boolean = true, clearUrl: Boolean = false) {
-        Log.d(TAG, "Releasing all resources (updateState=$updateState, clearUrl=$clearUrl)...")
+    private fun releaseAllResources() {
+        Log.d(TAG, "Releasing all resources...")
+        
+        if (::watchdogManager.isInitialized) {
+            watchdogManager.setCamera(null)
+        }
         
         genericCamera2?.let { camera ->
             try {
-                // 无条件调用 stopStream()，确保释放 TCP 连接
-                // 即使 isStreaming 为 false，也调用以确保底层资源释放
-                try {
-                    camera.stopStream()
-                    Log.d(TAG, "stopStream called")
-                } catch (e: Exception) {
-                    Log.w(TAG, "stopStream failed: ${e.message}")
-                }
-                
-                // 停止预览，释放摄像头和麦克风
-                try {
-                    camera.stopPreview()
-                    Log.d(TAG, "stopPreview called")
-                } catch (e: Exception) {
-                    Log.w(TAG, "stopPreview failed: ${e.message}")
-                }
-                
-                // 停止摄像头
-                try {
-                    camera.stopCamera()
-                    Log.d(TAG, "stopCamera called")
-                } catch (e: Exception) {
-                    Log.w(TAG, "stopCamera failed: ${e.message}")
-                }
-                
-                Log.d(TAG, "All camera resources released successfully")
+                try { camera.stopStream() } catch (e: Exception) { Log.w(TAG, "stopStream failed: ${e.message}") }
+                try { camera.stopPreview() } catch (e: Exception) { Log.w(TAG, "stopPreview failed: ${e.message}") }
+                try { camera.stopCamera() } catch (e: Exception) { Log.w(TAG, "stopCamera failed: ${e.message}") }
+                Log.d(TAG, "All camera resources released")
             } catch (e: Exception) {
                 Log.e(TAG, "Error releasing camera resources", e)
             }
         }
         
-        // 清空摄像头实例
         genericCamera2 = null
-        
-        // 根据参数决定是否更新状态
-        if (updateState) {
-            _streamState.value = StreamState.Idle
-        }
-        
-        // 根据参数决定是否清空 URL
-        if (clearUrl) {
-            currentRtmpUrl = ""
-        }
-        
-        Log.d(TAG, "Resource cleanup completed")
-    }
-
-    /**
-     * 兼容性方法：释放摄像头资源（用户主动停止）
-     */
-    private fun releaseCamera() {
-        releaseAllResources(updateState = true, clearUrl = false)
-    }
-
-    /**
-     * 兼容性方法：释放资源用于重连
-     */
-    private fun releaseResourcesForReconnect() {
-        releaseAllResources(updateState = false, clearUrl = false)
     }
     
     fun isStreaming(): Boolean = genericCamera2?.isStreaming == true
+    
+    fun getWatchdogConfig(): WatchdogManager.WatchdogConfig? {
+        return if (::watchdogManager.isInitialized) watchdogManager.getCurrentConfig() else null
+    }
+    
+    fun isWatchdogRunning(): Boolean {
+        return if (::watchdogManager.isInitialized) watchdogManager.isWatchdogRunning() else false
+    }
     
     // ==================== ConnectChecker 回调 ====================
     
     override fun onConnectionStarted(url: String) {
         Log.d(TAG, "Connection started: $url")
         handler.post {
+            if (stateManager.isStopped()) return@post
             _streamState.value = StreamState.Connecting
             updateNotification("正在连接...")
         }
@@ -434,33 +416,20 @@ class StreamService : Service(), ConnectChecker {
     override fun onConnectionSuccess() {
         Log.d(TAG, "Connection success!")
         handler.post {
-            // 连接成功，重置重连计数器
-            resetReconnectAttempts()
+            if (stateManager.isStopped()) return@post
+            
+            hasConnectedSuccessfully = true
+            
             _streamState.value = StreamState.Streaming()
             updateNotification("正在推流")
             
-            // ✅ 移到这里：连接成功后恢复音频和闪光灯状态
+            // 恢复音频和闪光灯状态
             genericCamera2?.let { camera ->
-                // 恢复音频状态
                 if (_isMuted.value) {
-                    try {
-                        camera.disableAudio()
-                        Log.d(TAG, "Audio mute state restored after connection success")
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Failed to restore audio mute state: ${e.message}")
-                    }
+                    try { camera.disableAudio() } catch (e: Exception) { Log.w(TAG, "Failed to restore mute: ${e.message}") }
                 }
-                
-                // 恢复闪光灯状态
                 if (_isFlashOn.value && _currentCameraFacing.value == CameraFacing.BACK) {
-                    try {
-                        if (camera.isLanternSupported) {
-                            camera.enableLantern()
-                            Log.d(TAG, "Flash state restored after connection success")
-                        }
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Failed to restore flash state: ${e.message}")
-                    }
+                    try { if (camera.isLanternSupported) camera.enableLantern() } catch (e: Exception) { Log.w(TAG, "Failed to restore flash: ${e.message}") }
                 }
             }
         }
@@ -469,33 +438,33 @@ class StreamService : Service(), ConnectChecker {
     override fun onConnectionFailed(reason: String) {
         Log.e(TAG, "Connection failed: $reason")
         handler.post {
-            // 所有连接失败都使用指数退避算法，不重置计数器
-            if (currentRtmpUrl.isNotEmpty()) {
+            releaseAllResources()  // 立即释放资源，避免TCP半连接
+            
+            if (stateManager.isStopped()) return@post
+            
+            // 只有在之前连接成功过的情况下才触发重连
+            if (hasConnectedSuccessfully) {
+                hasConnectedSuccessfully = false
+                Log.d(TAG, "Had successful connection before, scheduling reconnect")
                 _streamState.value = StreamState.Reconnecting
-                
-                if (reason.contains("UnresolvedAddressException") || reason.contains("UnknownHostException")) {
-                    Log.w(TAG, "Network address resolution failed, using exponential backoff")
-                    updateNotification("网络解析失败，准备重连...")
-                } else {
-                    Log.w(TAG, "Connection failed, using exponential backoff")
-                    updateNotification("连接失败，准备重连...")
-                }
-                // 资源释放移到 scheduleReconnect() 内部统一处理
+                updateNotification("连接失败，准备重连...")
                 scheduleReconnect()
             } else {
+                Log.d(TAG, "No prior successful connection, waiting for watchdog")
                 _streamState.value = StreamState.Error("连接失败: $reason")
-                updateNotification("连接失败")
-                releaseWakeLock()
+                updateNotification("连接失败，等待重试...")
             }
         }
     }
     
     override fun onNewBitrate(bitrate: Long) {
         handler.post {
-            val currentState = _streamState.value
-            if (currentState is StreamState.Streaming) {
-                _streamState.value = StreamState.Streaming(bitrate)
+            if (stateManager.isStopped()) return@post
+            
+            if (::watchdogManager.isInitialized) {
+                watchdogManager.updateBitrate(bitrate)
             }
+            
             _streamStats.value = _streamStats.value.copy(
                 bitrate = bitrate,
                 streamTime = System.currentTimeMillis() - streamStartTime
@@ -504,42 +473,27 @@ class StreamService : Service(), ConnectChecker {
     }
     
     override fun onDisconnect() {
-        Log.d(TAG, "onDisconnect called - checking if this is user-initiated")
+        Log.d(TAG, "onDisconnect called")
         handler.post {
-            // 根据 RootEncoder 文档，onDisconnect 主要在用户主动调用 disconnect() 时触发
-            // 如果 currentRtmpUrl 为空，说明是用户主动停止，不应该重连
-            // 如果 currentRtmpUrl 不为空，可能是异常断开，但需要谨慎处理
+            releaseAllResources()  // 立即释放资源，避免TCP半连接
             
-            if (currentRtmpUrl.isEmpty()) {
-                // 用户已主动停止推流，不需要重连
-                Log.d(TAG, "User-initiated disconnect, no reconnection needed")
-                _streamState.value = StreamState.Idle
-                updateNotification("推流已停止")
-                releaseWakeLock()
-            } else {
-                // ✅ 优化：检查当前状态，避免与 onConnectionFailed 重复处理
-                val currentState = _streamState.value
-                if (currentState is StreamState.Reconnecting) {
-                    // 如果已经在重连状态，说明 onConnectionFailed 已经处理了，忽略此次 onDisconnect
-                    Log.d(TAG, "Already in reconnecting state, ignoring onDisconnect (likely triggered after onConnectionFailed)")
-                    return@post
-                }
-                
-                // URL 不为空且不在重连状态，可能是异常断开
-                Log.w(TAG, "Unexpected onDisconnect with non-empty URL and not in reconnecting state")
-                Log.w(TAG, "This might be a genuine disconnect that wasn't caught by onConnectionFailed")
-                
-                // 保守处理：设置为重连状态并开始重连
-                _streamState.value = StreamState.Reconnecting
-                updateNotification("连接断开，准备重连...")
-                scheduleReconnect()
+            if (stateManager.isStopped()) {
+                Log.d(TAG, "User initiated disconnect, ignoring")
+                return@post
             }
+            
+            // 不触发重连，只更新状态，由 Watchdog 负责
+            Log.d(TAG, "Disconnect detected, waiting for watchdog")
+            _streamState.value = StreamState.Reconnecting
+            updateNotification("连接断开，等待重连...")
         }
     }
     
     override fun onAuthError() {
         Log.e(TAG, "Auth error")
         handler.post {
+            if (stateManager.isStopped()) return@post
+            stateManager.setStopped()
             _streamState.value = StreamState.Error("认证失败")
             updateNotification("认证失败")
             releaseWakeLock()
@@ -550,35 +504,25 @@ class StreamService : Service(), ConnectChecker {
         Log.d(TAG, "Auth success")
     }
     
-    // ==================== 指数退避重连逻辑 ====================
+    // ==================== 核心推流方法 ====================
     
-    /**
-     * 初始化摄像头并开始推流（核心方法）
-     * 被 startStreaming 和 performReconnect 共同调用
-     * 
-     * @param url RTMP 推流地址
-     * @param recalculateResolution 是否重新计算分辨率（首次启动为 true，重连为 false）
-     * @return 是否成功启动
-     */
     private fun initAndStartStream(url: String, recalculateResolution: Boolean = true): Boolean {
         try {
-            // 1. 创建 GenericCamera2 实例
             Log.d(TAG, "Creating GenericCamera2 with Context mode")
             val camera = GenericCamera2(this, this)
             genericCamera2 = camera
             
-            // 2. 设置视频编码器
+            // 立即设置 camera 到 watchdog，这样即使连接失败 watchdog 也能监控
+            if (::watchdogManager.isInitialized) {
+                watchdogManager.setCamera(camera)
+            }
+            
             val codec = when (currentSettings.videoCodec) {
                 com.example.camera_rtmp.data.VideoCodec.H264 -> VideoCodec.H264
-                com.example.camera_rtmp.data.VideoCodec.H265 -> {
-                    Log.w(TAG, "H.265 requires Enhanced RTMP server support")
-                    VideoCodec.H265
-                }
+                com.example.camera_rtmp.data.VideoCodec.H265 -> VideoCodec.H265
             }
             camera.setVideoCodec(codec)
-            Log.d(TAG, "Video codec set to: $codec")
             
-            // 3. 计算视频参数
             val rotation = when (currentSettings.videoRotation) {
                 VideoRotation.AUTO -> CameraHelper.getCameraOrientation(applicationContext)
                 else -> currentSettings.videoRotation.degrees
@@ -588,7 +532,6 @@ class StreamService : Service(), ConnectChecker {
             val videoHeight: Int
             
             if (recalculateResolution) {
-                // 首次启动：计算并保存分辨率
                 val settingsWidth = currentSettings.videoWidth
                 val settingsHeight = currentSettings.videoHeight
                 val (landscapeWidth, landscapeHeight) = if (settingsWidth < settingsHeight) {
@@ -598,22 +541,17 @@ class StreamService : Service(), ConnectChecker {
                 }
                 videoWidth = landscapeWidth
                 videoHeight = landscapeHeight
-                computedVideoWidth = videoWidth
-                computedVideoHeight = videoHeight
-                Log.d(TAG, "Calculated resolution: ${videoWidth}x${videoHeight}")
+                computedWidth = videoWidth
+                computedHeight = videoHeight
             } else {
-                // 重连：使用已保存的分辨率
-                videoWidth = computedVideoWidth
-                videoHeight = computedVideoHeight
-                Log.d(TAG, "Using saved resolution: ${videoWidth}x${videoHeight}")
+                videoWidth = computedWidth
+                videoHeight = computedHeight
             }
             
             Log.d(TAG, "Video params: ${videoWidth}x${videoHeight}, rotation=$rotation")
             
-            // 4. 准备视频编码器
             val videoPrepared = camera.prepareVideo(
-                videoWidth,
-                videoHeight,
+                videoWidth, videoHeight,
                 currentSettings.videoFps,
                 currentSettings.videoBitrate * 1000,
                 currentSettings.iFrameInterval,
@@ -624,9 +562,7 @@ class StreamService : Service(), ConnectChecker {
                 Log.e(TAG, "Failed to prepare video encoder")
                 return false
             }
-            Log.d(TAG, "Video encoder prepared successfully")
             
-            // 5. 准备音频编码器
             val audioPrepared = camera.prepareAudio(
                 currentSettings.audioBitrate * 1000,
                 currentSettings.audioSampleRate,
@@ -637,44 +573,30 @@ class StreamService : Service(), ConnectChecker {
             
             if (!audioPrepared) {
                 Log.w(TAG, "Failed to prepare audio encoder, continuing without audio")
-            } else {
-                Log.d(TAG, "Audio encoder prepared successfully")
             }
             
-            // 6. 启动摄像头数据采集
             val facing = if (currentSettings.cameraFacing == CameraFacing.FRONT) {
                 CameraHelper.Facing.FRONT
             } else {
                 CameraHelper.Facing.BACK
             }
             camera.startPreview(facing)
-            Log.d(TAG, "Camera capture started, isOnPreview=${camera.isOnPreview}")
             
-            // 7. 设置镜像（前置摄像头需要水平翻转）
             val isFrontCamera = currentSettings.cameraFacing == CameraFacing.FRONT
             try {
                 camera.getGlInterface().setIsStreamHorizontalFlip(isFrontCamera)
-                Log.d(TAG, "Stream horizontal flip: $isFrontCamera")
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to set stream horizontal flip: ${e.message}")
             }
             
-            // 8. 设置自动对焦
             if (currentSettings.autoFocus) {
-                try {
-                    camera.enableAutoFocus()
-                    Log.d(TAG, "Auto focus enabled")
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to enable auto focus: ${e.message}")
-                }
+                try { camera.enableAutoFocus() } catch (e: Exception) { Log.w(TAG, "Failed to enable auto focus: ${e.message}") }
             }
             
-            // 9. 开始推流
             Log.d(TAG, "Starting stream to: $url")
             camera.startStream(url)
             streamStartTime = System.currentTimeMillis()
             
-            Log.d(TAG, "Stream started, isStreaming=${camera.isStreaming}")
             return true
             
         } catch (e: Exception) {
@@ -683,192 +605,73 @@ class StreamService : Service(), ConnectChecker {
         }
     }
     
-    /**
-     * 重置重连尝试计数器
-     */
-    private fun resetReconnectAttempts() {
-        reconnectAttempts = 0
-        firstReconnectTime = 0L
-        Log.d(TAG, "Reset reconnect attempts, base delay: ${baseReconnectDelay}ms")
-    }
+    // ==================== 简化的重连管理 ====================
     
-    /**
-     * 计算指数退避延迟时间
-     * 算法：delay = baseDelay * (2^attempts) + jitter
-     * 
-     * 参数：
-     * - 第一次从1秒开始
-     * - 最大延迟1小时
-     * - 最大重连时间30天
-     * 
-     * 安全防护：
-     * - 防止位移溢出
-     * - 防止时间计算异常
-     * - 添加异常捕获
-     */
-    private fun calculateBackoffDelay(): Long {
-        return try {
-            val currentTime = System.currentTimeMillis()
-            
-            // 记录首次重连时间
-            if (firstReconnectTime == 0L) {
-                firstReconnectTime = currentTime
-            }
-            
-            // 检查是否超过最大重连时间（30天）
-            val reconnectDuration = currentTime - firstReconnectTime
-            if (reconnectDuration > maxReconnectDuration) {
-                Log.w(TAG, "Max reconnect duration (30 days) reached, stopping reconnection")
-                handler.post {
-                    _streamState.value = StreamState.Error("重连时间超限（30天）")
-                    updateNotification("重连超时")
-                    releaseWakeLock()
-                }
-                return -1 // 表示停止重连
-            }
-            
-            // 指数退避：1秒 * (2^attempts)，防止溢出
-            val exponentialDelay = if (reconnectAttempts >= 20) {
-                // 防止位移溢出，20次后直接使用最大延迟
-                maxReconnectDelay
-            } else {
-                val power = 1L shl reconnectAttempts
-                val delay = baseReconnectDelay * power
-                // 检查是否溢出或超过最大值
-                if (delay < 0 || delay > maxReconnectDelay) {
-                    maxReconnectDelay
-                } else {
-                    delay
-                }
-            }
-            
-            // 添加随机抖动（0-25%），避免多个客户端同时重连
-            val jitter = try {
-                (exponentialDelay * 0.25 * Math.random()).toLong()
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to calculate jitter, using 0", e)
-                0L
-            }
-            
-            // 限制最大延迟为1小时
-            val finalDelay = minOf(exponentialDelay + jitter, maxReconnectDelay)
-            
-            val remainingDays = (maxReconnectDuration - reconnectDuration) / (24 * 60 * 60 * 1000L)
-            Log.d(TAG, "Reconnect attempt ${reconnectAttempts + 1}, delay: ${finalDelay}ms (${finalDelay/1000}s), remaining: ${remainingDays}天")
-            
-            finalDelay
-        } catch (e: Exception) {
-            Log.e(TAG, "Exception in calculateBackoffDelay", e)
-            // 发生异常时返回固定延迟
-            60 * 1000L // 1分钟
-        }
-    }
-    
-    /**
-     * 重构后的重连逻辑
-     * 根据RootEncoder API文档，采用完全重新初始化的方式
-     */
     private fun scheduleReconnect() {
-        // 1. 取消之前的重连任务（防重入）
         cancelReconnect()
         
-        // 2. 立即释放资源，确保干净的重连环境
-        Log.d(TAG, "Releasing resources before scheduling reconnect...")
-        releaseResourcesForReconnect()
+        Log.d(TAG, "Scheduling reconnect")
         
-        try {
-            val delay = calculateBackoffDelay()
-            if (delay < 0) {
-                return // 停止重连
-            }
-            
-            reconnectRunnable = Runnable {
-                try {
-                    if (_streamState.value is StreamState.Reconnecting && currentRtmpUrl.isNotEmpty()) {
-                        reconnectAttempts++
-                        Log.d(TAG, "=== 开始重连 (第${reconnectAttempts}次尝试) ===")
-                        
-                        // 根据RootEncoder文档，重连时应该完全重新初始化
-                        performReconnect()
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "重连准备阶段异常", e)
-                    // 重连准备阶段的异常不再调用 scheduleReconnect()
-                    // 连接相关的失败会通过 onConnectionFailed 统一处理
-                    handler.post {
-                        if (_streamState.value is StreamState.Reconnecting) {
-                            // 准备阶段失败，直接设置为错误状态，避免与 onConnectionFailed 重复
-                            _streamState.value = StreamState.Error("重连准备失败: ${e.message}")
-                            updateNotification("重连准备失败")
-                            releaseWakeLock()
-                        }
-                    }
-                }
-            }
-            
-            handler.postDelayed(reconnectRunnable!!, delay)
-            
-            // 计算显示信息
-            val delaySeconds = delay / 1000
-            val displayTime = when {
-                delaySeconds < 60 -> "${delaySeconds}秒"
-                delaySeconds < 3600 -> "${delaySeconds / 60}分钟"
-                else -> "${delaySeconds / 3600}小时"
-            }
-            
-            val remainingDays = if (firstReconnectTime > 0) {
-                val elapsed = System.currentTimeMillis() - firstReconnectTime
-                (maxReconnectDuration - elapsed) / (24 * 60 * 60 * 1000L)
-            } else 30L
-            
-            updateNotification("重连中... 延迟${displayTime} (剩余${remainingDays}天)")
-            
-        } catch (e: Exception) {
-            Log.e(TAG, "重连调度异常", e)
-            // 调度异常时，确保完全清理资源
-            releaseAllResources(updateState = true, clearUrl = true)
-            releaseWakeLock()
-            _streamState.value = StreamState.Error("重连调度异常: ${e.message}")
-            updateNotification("重连调度失败")
+        reconnectJob = serviceScope.launch {
+            performReconnect()
         }
-    }
-    
-    /**
-     * 执行重连操作
-     * 根据RootEncoder文档，完全重新初始化摄像头和编码器
-     * 资源已在调度重连前释放，这里只需重新创建
-     */
-    private fun performReconnect() {
-        Log.d(TAG, "执行重连操作...")
-        
-        // 资源已经在 scheduleReconnect 调度前释放
-        // 这里只需确保 genericCamera2 为 null
-        if (genericCamera2 != null) {
-            Log.w(TAG, "Camera instance still exists, releasing...")
-            releaseResourcesForReconnect()
-        }
-        
-        // 等待一小段时间确保资源完全释放
-        Thread.sleep(500)
-        
-        // 使用公共方法初始化并开始推流（重连时不重新计算分辨率）
-        val success = initAndStartStream(currentRtmpUrl, recalculateResolution = false)
-        if (!success) {
-            throw Exception("重连初始化失败")
-        }
-        
-        Log.d(TAG, "=== 重连操作完成 ===")
     }
     
     private fun cancelReconnect() {
-        try {
-            reconnectRunnable?.let { 
-                handler.removeCallbacks(it)
-                Log.d(TAG, "Cancelled reconnect runnable")
+        reconnectJob?.cancel()
+        reconnectJob = null
+    }
+    
+    private suspend fun performReconnect() {
+        if (stateManager.isStopped()) {
+            Log.d(TAG, "Status is STOPPED, skipping reconnect")
+            return
+        }
+        
+        if (currentUrl.isEmpty()) {
+            Log.e(TAG, "Reconnect URL is empty")
+            return
+        }
+        
+        Log.d(TAG, "=== Performing reconnect ===")
+        
+        releaseAllResources()
+        
+        Log.d(TAG, "Resources released, waiting ${RECONNECT_DELAY_MS}ms before reconnect")
+        delay(RECONNECT_DELAY_MS)
+        
+        if (stateManager.isStopped()) {
+            Log.d(TAG, "Status changed to STOPPED during delay, aborting reconnect")
+            return
+        }
+        
+        val success = initAndStartStream(currentUrl, recalculateResolution = false)
+        if (!success) {
+            Log.e(TAG, "Reconnect initialization failed, waiting for watchdog")
+        }
+        
+        Log.d(TAG, "=== Reconnect operation completed ===")
+    }
+    
+    private fun handleWatchdogAnomaly(anomaly: WatchdogManager.WatchdogAnomaly) {
+        Log.w(TAG, "Watchdog anomaly: ${anomaly.description} (${anomaly.severity})")
+        
+        if (stateManager.isStopped()) {
+            Log.d(TAG, "Status is STOPPED, ignoring watchdog anomaly")
+            return
+        }
+        
+        when (anomaly.severity) {
+            WatchdogManager.WatchdogAnomaly.Severity.WARNING -> {
+                updateNotification("推流异常: ${anomaly.description}")
             }
-            reconnectRunnable = null
-        } catch (e: Exception) {
-            Log.e(TAG, "Exception in cancelReconnect", e)
+            WatchdogManager.WatchdogAnomaly.Severity.ERROR,
+            WatchdogManager.WatchdogAnomaly.Severity.CRITICAL -> {
+                Log.w(TAG, "Watchdog detected error, triggering reconnect")
+                _streamState.value = StreamState.Reconnecting
+                updateNotification("检测到异常，准备重连...")
+                scheduleReconnect()
+            }
         }
     }
     
@@ -883,15 +686,11 @@ class StreamService : Service(), ConnectChecker {
                 "CameraRtmp::StreamingWakeLock"
             )
         }
-        wakeLock?.acquire(10 * 60 * 60 * 1000L) // 10 hours max
+        wakeLock?.acquire(10 * 60 * 60 * 1000L)
     }
     
     private fun releaseWakeLock() {
-        wakeLock?.let {
-            if (it.isHeld) {
-                it.release()
-            }
-        }
+        wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
     }
     
@@ -907,11 +706,8 @@ class StreamService : Service(), ConnectChecker {
         )
         
         val stopIntent = PendingIntent.getService(
-            this,
-            1,
-            Intent(this, StreamService::class.java).apply {
-                action = ACTION_STOP_STREAMING
-            },
+            this, 1,
+            Intent(this, StreamService::class.java).apply { action = ACTION_STOP_STREAMING },
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         

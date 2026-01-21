@@ -35,7 +35,15 @@ data class StreamSettings(
     val filterType: FilterType = FilterType.NONE,
     
     // 其他设置
-    val keepScreenOn: Boolean = true
+    val keepScreenOn: Boolean = true,
+    
+    // Watchdog监控设置
+    val watchdogEnabled: Boolean = true,
+    val watchdogCheckInterval: Long = 5000L, // 5秒检查一次
+    val watchdogBitrateTimeout: Long = 30000L, // 30秒无码率视为异常
+    val watchdogMinBitrateThreshold: Long = 1000L, // 最小码率1kbps
+    val watchdogMaxZeroBitrateCount: Int = 6, // 最多6次连续零码率
+    val watchdogConnectionTimeout: Long = 60000L // 60秒连接超时
 ) {
     fun toJson(): String = Gson().toJson(this)
     

@@ -263,10 +263,13 @@ fun MainScreen(
                 hasPermissions = hasPermissions,
                 onStartStop = {
                     if (streamService != null && hasPermissions) {
+                        // 任何非 Idle 状态都应该能够停止
                         if (streamState is StreamState.Streaming || 
                             streamState is StreamState.Connecting ||
-                            streamState is StreamState.Reconnecting) {
-                            Log.d(TAG, "Stopping streaming")
+                            streamState is StreamState.Reconnecting ||
+                            streamState is StreamState.Preparing ||
+                            streamState is StreamState.Error) {
+                            Log.d(TAG, "Stopping streaming (current state: $streamState)")
                             streamService.stopStreaming()
                             StreamService.stopService(context)
                         } else {
@@ -458,9 +461,15 @@ private fun BottomControlBar(
     onSettings: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val isStreaming = streamState is StreamState.Streaming || 
-                      streamState is StreamState.Connecting ||
-                      streamState is StreamState.Reconnecting
+    // 是否正在推流（用于控制静音、闪光灯、切换摄像头按钮）
+    val isStreaming = streamState is StreamState.Streaming
+    
+    // 是否处于活动状态（用于显示停止按钮）
+    val isActive = streamState is StreamState.Streaming || 
+                   streamState is StreamState.Connecting ||
+                   streamState is StreamState.Reconnecting ||
+                   streamState is StreamState.Preparing ||
+                   streamState is StreamState.Error
     
     Surface(
         modifier = modifier,
@@ -509,12 +518,12 @@ private fun BottomControlBar(
                 // Start/Stop button
                 FloatingActionButton(
                     onClick = onStartStop,
-                    containerColor = if (isStreaming) Color.Red else MaterialTheme.colorScheme.primary,
+                    containerColor = if (isActive) Color.Red else MaterialTheme.colorScheme.primary,
                     modifier = Modifier.size(72.dp)
                 ) {
                     Icon(
-                        imageVector = if (isStreaming) Icons.Default.Stop else Icons.Default.PlayArrow,
-                        contentDescription = if (isStreaming) "停止" else "开始",
+                        imageVector = if (isActive) Icons.Default.Stop else Icons.Default.PlayArrow,
+                        contentDescription = if (isActive) "停止" else "开始",
                         modifier = Modifier.size(36.dp)
                     )
                 }
