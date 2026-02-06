@@ -6,9 +6,12 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.os.PowerManager
+import android.provider.Settings
 import android.util.Log
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -82,6 +85,9 @@ class MainActivity : ComponentActivity() {
             startAndBindService()
         }
         
+        // 请求忽略电池优化
+        requestIgnoreBatteryOptimization()
+        
         setContent {
             CamerartmpTheme {
                 Surface(
@@ -109,6 +115,37 @@ class MainActivity : ComponentActivity() {
         // 绑定服务
         Intent(this, StreamService::class.java).also { intent ->
             bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+        }
+    }
+    
+    /**
+     * 请求忽略电池优化
+     * 这对于长时间后台推流非常重要，特别是在华为/荣耀等手机上
+     */
+    private fun requestIgnoreBatteryOptimization() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+                val packageName = packageName
+                
+                if (!powerManager.isIgnoringBatteryOptimizations(packageName)) {
+                    Log.d(TAG, "Requesting to ignore battery optimizations")
+                    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                        data = Uri.parse("package:$packageName")
+                    }
+                    
+                    // 检查是否有应用可以处理这个 Intent
+                    if (intent.resolveActivity(packageManager) != null) {
+                        startActivity(intent)
+                    } else {
+                        Log.w(TAG, "No app can handle battery optimization request")
+                    }
+                } else {
+                    Log.d(TAG, "Already ignoring battery optimizations")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error requesting battery optimization ignore", e)
         }
     }
     

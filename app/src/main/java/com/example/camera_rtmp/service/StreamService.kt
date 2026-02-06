@@ -32,17 +32,17 @@ import kotlinx.coroutines.flow.asStateFlow
  * 设计原则：
  * 1. 只有两个状态：STOPPED/RUNNING
  * 2. Watchdog 永久运行，根据状态判断是否执行检查
- * 3. 重连逻辑简单：延迟2秒后重连
+ * 3. 重连逻辑简单：延迟3秒后重连
  * 4. onDisconnect 不触发重连
- * 5. onConnectionFailed 只在之前成功过时触发一次重连
- * 6. 其他异常由 Watchdog 监控处理
+ * 5. onConnectionFailed 不触发重连，由 Watchdog 统一监控
+ * 6. 所有异常由 Watchdog 监控处理，简化架构
  */
 class StreamService : Service(), ConnectChecker {
     
     companion object {
         private const val TAG = "StreamService"
         private const val NOTIFICATION_ID = 1001
-        private const val RECONNECT_DELAY_MS = 2000L  // 重连前等待时间
+        private const val RECONNECT_DELAY_MS = 3000L  // 重连前等待时间
         
         const val ACTION_START_STREAMING = "com.example.camera_rtmp.START_STREAMING"
         const val ACTION_STOP_STREAMING = "com.example.camera_rtmp.STOP_STREAMING"
@@ -79,14 +79,6 @@ class StreamService : Service(), ConnectChecker {
     
     // 当前推流 URL
     private var currentUrl: String = ""
-    
-    // 计算后的视频尺寸（重连时保持一致）
-    private var computedWidth: Int = 0
-    private var computedHeight: Int = 0
-    
-    // 标记是否曾经连接成功（用于控制 onConnectionFailed 的重连）
-    @Volatile
-    private var hasConnectedSuccessfully = false
     
     // 重连任务
     private var reconnectJob: Job? = null
@@ -137,18 +129,8 @@ class StreamService : Service(), ConnectChecker {
             onAnomalyDetected = { anomaly -> handleWatchdogAnomaly(anomaly) }
         )
         
-        // 启动永久运行的 Watchdog
-        val watchdogConfig = WatchdogManager.WatchdogConfig(
-            checkInterval = currentSettings.watchdogCheckInterval,
-            bitrateTimeout = currentSettings.watchdogBitrateTimeout,
-            minBitrateThreshold = currentSettings.watchdogMinBitrateThreshold,
-            maxZeroBitrateCount = currentSettings.watchdogMaxZeroBitrateCount,
-            connectionTimeout = currentSettings.watchdogConnectionTimeout,
-            enableBitrateMonitoring = currentSettings.watchdogEnabled,
-            enableConnectionMonitoring = currentSettings.watchdogEnabled,
-            enableEncoderMonitoring = currentSettings.watchdogEnabled
-        )
-        watchdogManager.startPermanentWatchdog(watchdogConfig, serviceScope)
+        // 启动永久运行的 Watchdog（使用默认配置，所有参数由 WatchdogManager 内部管理）
+        watchdogManager.startPermanentWatchdog(scope = serviceScope)
         
         Log.d(TAG, "Permanent watchdog started")
     }
@@ -183,16 +165,22 @@ class StreamService : Service(), ConnectChecker {
         Log.d(TAG, "Service destroyed - performing complete cleanup")
         
         try {
-            serviceScope.cancel()
+            // 1. 先取消重连任务
+            cancelReconnect()
             
+            // 2. 销毁 watchdog（内部会取消 watchdogJob）
             if (::watchdogManager.isInitialized) {
                 watchdogManager.destroy()
             }
             
-            cancelReconnect()
+            // 3. 最后取消整个作用域（兜底）
+            serviceScope.cancel()
+            
+            // 4. 释放资源
             releaseAllResources()
             releaseWakeLock()
             
+            // 5. 重置状态
             stateManager.setStopped()
             _isServiceRunning.value = false
             _streamStats.value = StreamStats()
@@ -210,20 +198,7 @@ class StreamService : Service(), ConnectChecker {
         this.currentSettings = settings
         _currentCameraFacing.value = settings.cameraFacing
         
-        if (::watchdogManager.isInitialized) {
-            val watchdogConfig = WatchdogManager.WatchdogConfig(
-                checkInterval = settings.watchdogCheckInterval,
-                bitrateTimeout = settings.watchdogBitrateTimeout,
-                minBitrateThreshold = settings.watchdogMinBitrateThreshold,
-                maxZeroBitrateCount = settings.watchdogMaxZeroBitrateCount,
-                connectionTimeout = settings.watchdogConnectionTimeout,
-                enableBitrateMonitoring = settings.watchdogEnabled,
-                enableConnectionMonitoring = settings.watchdogEnabled,
-                enableEncoderMonitoring = settings.watchdogEnabled
-            )
-            watchdogManager.updateConfig(watchdogConfig)
-        }
-        
+        // Watchdog 使用内部默认配置，无需外部传入参数
         Log.d(TAG, "Streaming initialized with settings: $settings")
     }
     
@@ -249,7 +224,6 @@ class StreamService : Service(), ConnectChecker {
         
         // 重置状态
         currentUrl = url
-        hasConnectedSuccessfully = false
         stateManager.setRunning()
         
         _streamState.value = StreamState.Preparing
@@ -259,7 +233,7 @@ class StreamService : Service(), ConnectChecker {
             acquireWakeLock()
             releaseAllResources()
             
-            val success = initAndStartStream(url, recalculateResolution = true)
+            val success = initAndStartStream(url)
             if (!success) {
                 stateManager.setStopped()
                 _streamState.value = StreamState.Error("推流启动失败")
@@ -289,7 +263,6 @@ class StreamService : Service(), ConnectChecker {
             return
         }
         
-        hasConnectedSuccessfully = false
         cancelReconnect()
         stateManager.setStopped()
         releaseAllResources()
@@ -418,8 +391,6 @@ class StreamService : Service(), ConnectChecker {
         handler.post {
             if (stateManager.isStopped()) return@post
             
-            hasConnectedSuccessfully = true
-            
             _streamState.value = StreamState.Streaming()
             updateNotification("正在推流")
             
@@ -442,18 +413,10 @@ class StreamService : Service(), ConnectChecker {
             
             if (stateManager.isStopped()) return@post
             
-            // 只有在之前连接成功过的情况下才触发重连
-            if (hasConnectedSuccessfully) {
-                hasConnectedSuccessfully = false
-                Log.d(TAG, "Had successful connection before, scheduling reconnect")
-                _streamState.value = StreamState.Reconnecting
-                updateNotification("连接失败，准备重连...")
-                scheduleReconnect()
-            } else {
-                Log.d(TAG, "No prior successful connection, waiting for watchdog")
-                _streamState.value = StreamState.Error("连接失败: $reason")
-                updateNotification("连接失败，等待重试...")
-            }
+            // 不触发重连，由 Watchdog 统一监控处理
+            Log.d(TAG, "Connection failed, waiting for watchdog to handle reconnect")
+            _streamState.value = StreamState.Error("连接失败: $reason")
+            updateNotification("连接失败，等待重试...")
         }
     }
     
@@ -484,7 +447,7 @@ class StreamService : Service(), ConnectChecker {
             
             // 不触发重连，只更新状态，由 Watchdog 负责
             Log.d(TAG, "Disconnect detected, waiting for watchdog")
-            _streamState.value = StreamState.Reconnecting
+            //_streamState.value = StreamState.Reconnecting
             updateNotification("连接断开，等待重连...")
         }
     }
@@ -492,6 +455,8 @@ class StreamService : Service(), ConnectChecker {
     override fun onAuthError() {
         Log.e(TAG, "Auth error")
         handler.post {
+            releaseAllResources()  // 释放资源，避免TCP半连接
+            
             if (stateManager.isStopped()) return@post
             stateManager.setStopped()
             _streamState.value = StreamState.Error("认证失败")
@@ -506,7 +471,7 @@ class StreamService : Service(), ConnectChecker {
     
     // ==================== 核心推流方法 ====================
     
-    private fun initAndStartStream(url: String, recalculateResolution: Boolean = true): Boolean {
+    private fun initAndStartStream(url: String): Boolean {
         try {
             Log.d(TAG, "Creating GenericCamera2 with Context mode")
             val camera = GenericCamera2(this, this)
@@ -528,24 +493,13 @@ class StreamService : Service(), ConnectChecker {
                 else -> currentSettings.videoRotation.degrees
             }
             
-            val videoWidth: Int
-            val videoHeight: Int
-            
-            if (recalculateResolution) {
-                val settingsWidth = currentSettings.videoWidth
-                val settingsHeight = currentSettings.videoHeight
-                val (landscapeWidth, landscapeHeight) = if (settingsWidth < settingsHeight) {
-                    settingsHeight to settingsWidth
-                } else {
-                    settingsWidth to settingsHeight
-                }
-                videoWidth = landscapeWidth
-                videoHeight = landscapeHeight
-                computedWidth = videoWidth
-                computedHeight = videoHeight
+            // 确保宽 > 高（横向模式）
+            val settingsWidth = currentSettings.videoWidth
+            val settingsHeight = currentSettings.videoHeight
+            val (videoWidth, videoHeight) = if (settingsWidth < settingsHeight) {
+                settingsHeight to settingsWidth
             } else {
-                videoWidth = computedWidth
-                videoHeight = computedHeight
+                settingsWidth to settingsHeight
             }
             
             Log.d(TAG, "Video params: ${videoWidth}x${videoHeight}, rotation=$rotation")
@@ -645,7 +599,7 @@ class StreamService : Service(), ConnectChecker {
             return
         }
         
-        val success = initAndStartStream(currentUrl, recalculateResolution = false)
+        val success = initAndStartStream(currentUrl)
         if (!success) {
             Log.e(TAG, "Reconnect initialization failed, waiting for watchdog")
         }

@@ -8,7 +8,6 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlin.math.sqrt
 
 /**
  * 推流监控管理器 (Watchdog) - 永久运行模式
@@ -34,11 +33,14 @@ class WatchdogManager(
         private const val TAG = "WatchdogManager"
         
         // 默认配置
-        private const val DEFAULT_CHECK_INTERVAL = 5000L // 5秒检查一次
+        private const val DEFAULT_CHECK_INTERVAL = 10000L // 10秒检查一次
         private const val DEFAULT_BITRATE_TIMEOUT = 30000L // 30秒无码率视为异常
-        private const val DEFAULT_MIN_BITRATE_THRESHOLD = 1000L // 最小码率阈值 1kbps
-        private const val DEFAULT_MAX_ZERO_BITRATE_COUNT = 6 // 最多允许6次连续零码率（30秒）
+        private const val DEFAULT_MIN_BITRATE_THRESHOLD = 100000L // 最小码率阈值 100kbps
+        private const val DEFAULT_ZERO_BITRATE_THRESHOLD = 10000L // 零码率阈值 10kbps（低于此视为零码率）
+        private const val DEFAULT_ZERO_BITRATE_DURATION = 30000L // 零码率持续30秒触发重连
+        private const val DEFAULT_LOW_BITRATE_DURATION = 60000L // 低码率持续60秒触发重连
         private const val DEFAULT_CONNECTION_TIMEOUT = 60000L // 60秒连接超时
+        private const val DEFAULT_FIRST_BITRATE_TIMEOUT = 20000L // 首次码率超时 20秒
     }
     
     /**
@@ -48,8 +50,11 @@ class WatchdogManager(
         val checkInterval: Long = DEFAULT_CHECK_INTERVAL,
         val bitrateTimeout: Long = DEFAULT_BITRATE_TIMEOUT,
         val minBitrateThreshold: Long = DEFAULT_MIN_BITRATE_THRESHOLD,
-        val maxZeroBitrateCount: Int = DEFAULT_MAX_ZERO_BITRATE_COUNT,
+        val zeroBitrateThreshold: Long = DEFAULT_ZERO_BITRATE_THRESHOLD,
+        val zeroBitrateDuration: Long = DEFAULT_ZERO_BITRATE_DURATION,
+        val lowBitrateDuration: Long = DEFAULT_LOW_BITRATE_DURATION,
         val connectionTimeout: Long = DEFAULT_CONNECTION_TIMEOUT,
+        val firstBitrateTimeout: Long = DEFAULT_FIRST_BITRATE_TIMEOUT, // 首次码率超时
         val enableBitrateMonitoring: Boolean = true,
         val enableConnectionMonitoring: Boolean = true,
         val enableEncoderMonitoring: Boolean = true
@@ -67,21 +72,17 @@ class WatchdogManager(
         )
         
         class LowBitrate(currentBitrate: Long, threshold: Long) : WatchdogAnomaly(
-            "码率过低: ${currentBitrate}bps < ${threshold}bps", Severity.WARNING
+            "码率过低: ${currentBitrate/1000}kbps < ${threshold/1000}kbps", Severity.ERROR
         )
         
-        class BitrateFluctuation(variance: Double) : WatchdogAnomaly(
-            "码率波动异常: 方差=${String.format("%.2f", variance)}", Severity.WARNING
-        )
+
         
         // 连接相关异常
         class ConnectionStuck(duration: Long) : WatchdogAnomaly(
             "连接卡死 ${duration/1000} 秒", Severity.CRITICAL
         )
         
-        class StreamingTimeout(duration: Long) : WatchdogAnomaly(
-            "推流超时 ${duration/1000} 秒", Severity.ERROR
-        )
+
         
         // 编码器相关异常
         class EncoderError(error: String) : WatchdogAnomaly(
@@ -107,7 +108,7 @@ class WatchdogManager(
         val currentBitrate: Long = 0L,
         val averageBitrate: Long = 0L,
         val bitrateHistory: List<Long> = emptyList(),
-        val zeroBitrateCount: Int = 0,
+        val zeroBitrateFirstDetected: Long = 0L,  // 零码率首次检测时间（0表示正常）
         val lastAnomalyTime: Long = 0L,
         val lastAnomalyType: String = ""
     )
@@ -128,7 +129,7 @@ class WatchdogManager(
     // 码率监控
     private var currentBitrate = 0L
     private var lastBitrateUpdateTime = 0L
-    private var zeroBitrateCount = 0
+    private var zeroBitrateFirstDetected = 0L  // 零码率首次检测时间
     private var bitrateHistory = mutableListOf<Long>()
     private val maxHistorySize = 20 // 保留最近20次记录
     
@@ -139,14 +140,11 @@ class WatchdogManager(
     private var lastAnomalyTime = 0L
     private var lastAnomalyType = ""
     
-    // 异常防抖机制
-    private val anomalyDebounceMap = mutableMapOf<String, Long>()
-    private val anomalyDebounceInterval = 30000L // 30秒内同类型异常只报告一次
+
     
     // 异常状态跟踪
     private var connectionStuckFirstDetected = 0L
     private var lowBitrateFirstDetected = 0L
-    private var bitrateFluctuationFirstDetected = 0L
     
     // 状态流
     private val _stats = MutableStateFlow(WatchdogStats())
@@ -300,9 +298,9 @@ class WatchdogManager(
             }
         }
         
-        // 重置零码率计数（如果码率恢复）
-        if (bitrate > 0) {
-            zeroBitrateCount = 0
+        // 重置零码率时间戳（如果码率恢复正常）
+        if (bitrate >= config.zeroBitrateThreshold) {
+            zeroBitrateFirstDetected = 0L
         }
     }
     
@@ -319,10 +317,15 @@ class WatchdogManager(
             return
         }
         
-        // 关键检查：如果从未收到过码率更新，说明连接失败
+        // 检查是否从未收到过码率更新（给予更长的启动时间，避免误判）
         if (lastBitrateUpdateTime == 0L) {
-            Log.w(TAG, "No bitrate received since start (${timeSinceStart}ms), connection likely failed")
-            reportAnomaly(WatchdogAnomaly.ZeroBitrate(timeSinceStart))
+            // 使用配置的首次码率超时时间，避免网络较慢时的误判
+            if (timeSinceStart > config.firstBitrateTimeout) {
+                Log.w(TAG, "No bitrate received after ${timeSinceStart/1000}s, connection likely failed")
+                reportAnomaly(WatchdogAnomaly.ZeroBitrate(timeSinceStart))
+            } else {
+                Log.d(TAG, "Still waiting for first bitrate update (${timeSinceStart/1000}s < ${config.firstBitrateTimeout/1000}s)")
+            }
             return
         }
         
@@ -333,51 +336,33 @@ class WatchdogManager(
             return
         }
         
-        // 检查零码率
-        if (currentBitrate == 0L) {
-            zeroBitrateCount++
-            if (zeroBitrateCount >= config.maxZeroBitrateCount) {
-                val duration = zeroBitrateCount * config.checkInterval
+        // 检查零码率（使用时间检测，低于 10kbps 持续30秒视为异常）
+        if (currentBitrate < config.zeroBitrateThreshold) {
+            val now = System.currentTimeMillis()
+            if (zeroBitrateFirstDetected == 0L) {
+                zeroBitrateFirstDetected = now
+            } else if (now - zeroBitrateFirstDetected > config.zeroBitrateDuration) {
+                val duration = now - zeroBitrateFirstDetected
                 reportAnomaly(WatchdogAnomaly.ZeroBitrate(duration))
                 return
             }
         } else {
-            // 码率恢复，重置计数器
-            zeroBitrateCount = 0
+            // 码率恢复，重置时间戳
+            zeroBitrateFirstDetected = 0L
         }
         
-        // 检查低码率（添加防抖）
-        if (currentBitrate > 0 && currentBitrate < config.minBitrateThreshold) {
+        // 检查低码率（低于 100kbps 但高于零码率阈值，持续60秒触发重连）
+        if (currentBitrate >= config.zeroBitrateThreshold && currentBitrate < config.minBitrateThreshold) {
             val now = System.currentTimeMillis()
             if (lowBitrateFirstDetected == 0L) {
                 lowBitrateFirstDetected = now
-            } else if (now - lowBitrateFirstDetected > 15000) { // 持续15秒低码率才报警
-                reportAnomalyWithDebounce(WatchdogAnomaly.LowBitrate(currentBitrate, config.minBitrateThreshold))
+            } else if (now - lowBitrateFirstDetected > config.lowBitrateDuration) {
+                reportAnomaly(WatchdogAnomaly.LowBitrate(currentBitrate, config.minBitrateThreshold))
+                return
             }
         } else {
             // 码率恢复正常
             lowBitrateFirstDetected = 0L
-        }
-        
-        // 检查码率波动（需要足够的历史数据）
-        synchronized(bitrateHistory) {
-            if (bitrateHistory.size >= 10) {
-                val nonZeroRates = bitrateHistory.filter { it > 0 }
-                if (nonZeroRates.size >= 5) {
-                    val variance = calculateVariance(nonZeroRates)
-                    val mean = nonZeroRates.average()
-                    val standardDeviation = sqrt(variance)
-                    val coefficientOfVariation = if (mean > 0) standardDeviation / mean else 0.0
-                    
-                    // 如果变异系数过大（超过50%），认为是异常波动
-                    if (coefficientOfVariation > 0.5) {
-                        reportAnomalyWithDebounce(WatchdogAnomaly.BitrateFluctuation(variance))
-                    } else {
-                        // 码率波动恢复正常
-                        bitrateFluctuationFirstDetected = 0L
-                    }
-                }
-            }
         }
     }
     
@@ -395,14 +380,14 @@ class WatchdogManager(
             // 检查是否还在推流
             if (!isStreaming) {
                 // 只有在启动一段时间后才检测连接卡死，避免启动时误报
-                if (timeSinceStart > 5000) { // 启动5秒后才检测
+                if (timeSinceStart > 10000) { // 启动10秒后才检测
                     if (connectionStuckFirstDetected == 0L) {
                         connectionStuckFirstDetected = now
                         Log.d(TAG, "Connection stuck detection started")
                     } else {
                         val stuckDuration = now - connectionStuckFirstDetected
                         Log.d(TAG, "Connection stuck duration: ${stuckDuration}ms")
-                        if (stuckDuration > 10000) { // 持续10秒才报警
+                        if (stuckDuration > 20000) { // 持续20秒才报警
                             Log.w(TAG, "Connection stuck for ${stuckDuration}ms, triggering anomaly")
                             reportAnomaly(WatchdogAnomaly.ConnectionStuck(stuckDuration))
                             return
@@ -415,13 +400,7 @@ class WatchdogManager(
                 connectionStuckFirstDetected = 0L
             }
             
-            // 检查推流超时（如果长时间无码率更新）
-            if (lastBitrateUpdateTime > 0) {
-                val streamingDuration = now - lastBitrateUpdateTime
-                if (streamingDuration > config.connectionTimeout) {
-                    reportAnomaly(WatchdogAnomaly.StreamingTimeout(streamingDuration))
-                }
-            }
+            // 注意：码率超时检查已在 checkBitrateHealth() 中处理，避免重复检查
             
         } catch (e: Exception) {
             Log.w(TAG, "Connection health check failed", e)
@@ -451,27 +430,7 @@ class WatchdogManager(
         }
     }
     
-    /**
-     * 报告异常（带防抖机制）
-     */
-    private fun reportAnomalyWithDebounce(anomaly: WatchdogAnomaly) {
-        val anomalyKey = anomaly::class.java.simpleName
-        val now = System.currentTimeMillis()
-        
-        // 检查防抖间隔
-        val lastReportTime = anomalyDebounceMap[anomalyKey] ?: 0L
-        if (now - lastReportTime < anomalyDebounceInterval) {
-            Log.v(TAG, "Anomaly debounced: ${anomaly.description}")
-            return
-        }
-        
-        // 更新防抖时间戳
-        anomalyDebounceMap[anomalyKey] = now
-        
-        // 报告异常
-        reportAnomaly(anomaly)
-    }
-    
+
     /**
      * 报告异常
      */
@@ -524,7 +483,7 @@ class WatchdogManager(
             currentBitrate = currentBitrate,
             averageBitrate = averageBitrate,
             bitrateHistory = synchronized(bitrateHistory) { bitrateHistory.toList() },
-            zeroBitrateCount = zeroBitrateCount,
+            zeroBitrateFirstDetected = zeroBitrateFirstDetected,
             lastAnomalyTime = lastAnomalyTime,
             lastAnomalyType = lastAnomalyType
         )
@@ -536,7 +495,7 @@ class WatchdogManager(
     private fun resetMonitoringData() {
         currentBitrate = 0L
         lastBitrateUpdateTime = 0L
-        zeroBitrateCount = 0
+        zeroBitrateFirstDetected = 0L
         bitrateHistory.clear()
         lastAnomalyTime = 0L
         lastAnomalyType = ""
@@ -544,8 +503,6 @@ class WatchdogManager(
         // 重置异常状态跟踪
         connectionStuckFirstDetected = 0L
         lowBitrateFirstDetected = 0L
-        bitrateFluctuationFirstDetected = 0L
-        anomalyDebounceMap.clear()
         
         // 注意：不重置 totalChecks、effectiveChecks、skippedChecks，这些是累计值
     }
@@ -561,17 +518,7 @@ class WatchdogManager(
         startTime = System.currentTimeMillis()
         Log.i(TAG, "All counters reset due to overflow protection")
     }
-    
-    /**
-     * 计算方差
-     */
-    private fun calculateVariance(values: List<Long>): Double {
-        if (values.isEmpty()) return 0.0
-        
-        val mean = values.average()
-        val sumOfSquaredDifferences = values.sumOf { (it - mean) * (it - mean) }
-        return sumOfSquaredDifferences / values.size
-    }
+
     
     /**
      * 获取当前配置
